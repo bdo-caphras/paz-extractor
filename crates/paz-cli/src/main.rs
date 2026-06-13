@@ -3,6 +3,7 @@
 
 mod convert;
 mod index;
+mod manifest;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +13,7 @@ use paz_core::{IceKey, PazArchive, PAZ_ICE_KEY};
 use rayon::prelude::*;
 
 use index::ArchiveIndex;
+use manifest::{Manifest, ManifestEntry};
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +73,41 @@ enum Command {
         #[arg(long)]
         count: bool,
     },
+    /// Build a deterministic, path-sorted change-tracking manifest of every
+    /// virtual path: `path<TAB>paz_id<TAB>crc<TAB>orig_size<TAB>comp_size`.
+    /// Uses only the per-file `crc`/`orig_size` already in each PAZ index — no
+    /// payload is decompressed, so this is as fast as `index`. Two manifests of
+    /// different game builds `diff` cleanly to drive incremental extraction.
+    Manifest {
+        /// Where to write the manifest TSV.
+        #[arg(short = 'o', long, default_value = "paz-manifest.tsv")]
+        output: PathBuf,
+    },
+    /// Compare an OLD manifest against a NEW one (or a live scan of `-i`) and
+    /// classify every path as ADDED (`+`), MODIFIED (`~`), REMOVED (`-`) or
+    /// UNCHANGED. The `(crc, orig_size)` change key drives MODIFIED detection.
+    Diff {
+        /// Baseline manifest to compare against (produced by `manifest`).
+        #[arg(long)]
+        old: PathBuf,
+        /// Newer manifest. If omitted, a current manifest is built in-memory
+        /// from `-i` (a live scan of the archive set).
+        #[arg(long)]
+        new: Option<PathBuf>,
+        /// Restrict the comparison to these extensions (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        ext: Vec<String>,
+        /// Restrict the comparison to paths containing this substring.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Print only the changed paths (added + modified), one per line, for
+        /// piping. Suppresses the summary and status prefixes.
+        #[arg(long)]
+        names_only: bool,
+        /// Print only the per-class tallies, not the path lists.
+        #[arg(long)]
+        count: bool,
+    },
     /// Extract files to an output directory.
     Extract {
         /// Output root directory.
@@ -88,6 +125,11 @@ enum Command {
         /// Stop after this many files (0 = no limit). Useful for sampling.
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// Incremental mode: extract ONLY paths that are ADDED or MODIFIED
+        /// versus this baseline manifest (still honouring `--filter`/`--ext`/
+        /// `--convert`). This is the weekly delta path.
+        #[arg(long)]
+        changed_since: Option<PathBuf>,
     },
 }
 
@@ -169,16 +211,178 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             search(&cli.input, &ice, terms, cache, ext, limit, count)?;
         }
+        Command::Manifest { output } => {
+            let m = build_manifest(&cli.input, &ice)?;
+            m.write_tsv(&output)?;
+            eprintln!("wrote {} paths to {}", m.len(), output.display());
+        }
+        Command::Diff {
+            old,
+            new,
+            ext,
+            filter,
+            names_only,
+            count,
+        } => {
+            diff_cmd(&cli.input, &ice, old, new, ext, filter, names_only, count)?;
+        }
         Command::Extract {
             output,
             filter,
             ext,
             convert,
             limit,
+            changed_since,
         } => {
-            extract(&cli.input, &ice, output, filter, ext, convert, limit)?;
+            extract(
+                &cli.input,
+                &ice,
+                output,
+                filter,
+                ext,
+                convert,
+                limit,
+                changed_since,
+            )?;
         }
     }
+    Ok(())
+}
+
+/// Build an in-memory [`Manifest`] from the live archive set. Reuses the same
+/// index-parsing path as `stats`/`index` — only the per-file `crc`/sizes are
+/// read, never the payloads.
+fn build_manifest(
+    input: &std::path::Path,
+    ice: &IceKey,
+) -> Result<Manifest, Box<dyn std::error::Error>> {
+    let idx = ArchiveIndex::build(input, ice)?;
+    let mut m = Manifest::default();
+    for fe in &idx.files {
+        let paz_id = paz_id_of(&idx, fe.archive_idx);
+        m.insert(
+            fe.rec.path.clone(),
+            ManifestEntry {
+                paz_id,
+                crc: fe.rec.crc,
+                orig_size: fe.rec.orig_size,
+                comp_size: fe.rec.comp_size,
+            },
+        );
+    }
+    Ok(m)
+}
+
+/// Recover the numeric PAZ id (`N` in `PAD0000N.PAZ`) for an archive index by
+/// parsing it back out of the archive's filename.
+fn paz_id_of(idx: &ArchiveIndex, archive_idx: usize) -> u32 {
+    idx.archive_paths
+        .get(archive_idx)
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .and_then(|s| {
+            s.trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+/// Apply `--ext` / `--filter` restrictions to a path (used by `diff`).
+fn path_in_scope(path: &str, exts: &[String], filter: &Option<String>) -> bool {
+    if let Some(f) = filter {
+        if !path.to_lowercase().contains(f.as_str()) {
+            return false;
+        }
+    }
+    if !exts.is_empty() {
+        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
+        if !exts.iter().any(|e| e == &ext) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_cmd(
+    input: &std::path::Path,
+    ice: &IceKey,
+    old: PathBuf,
+    new: Option<PathBuf>,
+    exts: Vec<String>,
+    filter: Option<String>,
+    names_only: bool,
+    count_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exts: Vec<String> = exts.into_iter().map(|e| e.to_lowercase()).collect();
+    let filter = filter.map(|s| s.to_lowercase());
+
+    let old_m = Manifest::read_tsv(&old)?;
+    let new_m = match &new {
+        Some(p) => Manifest::read_tsv(p)?,
+        None => {
+            eprintln!(
+                "no --new manifest: building current manifest from {} …",
+                input.display()
+            );
+            build_manifest(input, ice)?
+        }
+    };
+
+    let d = manifest::diff(&old_m, &new_m);
+
+    // Apply scope filters to each class.
+    let scope = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .filter(|p| path_in_scope(p, &exts, &filter))
+            .cloned()
+            .collect()
+    };
+    let added = scope(&d.added);
+    let modified = scope(&d.modified);
+    let removed = scope(&d.removed);
+    let unchanged_n = d
+        .unchanged
+        .iter()
+        .filter(|p| path_in_scope(p, &exts, &filter))
+        .count();
+
+    if names_only {
+        // Added + modified, sorted, for piping.
+        let mut changed: Vec<&String> = added.iter().chain(modified.iter()).collect();
+        changed.sort();
+        for p in changed {
+            println!("{p}");
+        }
+        return Ok(());
+    }
+
+    if count_only {
+        println!("added     {}", added.len());
+        println!("modified  {}", modified.len());
+        println!("removed   {}", removed.len());
+        println!("unchanged {unchanged_n}");
+        return Ok(());
+    }
+
+    // Full summary + tagged path lists.
+    for p in &added {
+        println!("+ {p}");
+    }
+    for p in &modified {
+        println!("~ {p}");
+    }
+    for p in &removed {
+        println!("- {p}");
+    }
+    eprintln!(
+        "summary: {} added, {} modified, {} removed, {} unchanged",
+        added.len(),
+        modified.len(),
+        removed.len(),
+        unchanged_n
+    );
     Ok(())
 }
 
@@ -260,16 +464,51 @@ fn extract(
     exts: Vec<String>,
     convert: bool,
     limit: usize,
+    changed_since: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let idx = ArchiveIndex::build(input, ice)?;
     let needle = filter.map(|s| s.to_lowercase());
     let exts: Vec<String> = exts.into_iter().map(|e| e.to_lowercase()).collect();
+
+    // Incremental mode: build the set of ADDED/MODIFIED paths vs the baseline
+    // manifest. Only those (intersected with --filter/--ext) get extracted.
+    let changed_paths: Option<std::collections::HashSet<String>> = match changed_since {
+        Some(ref old_path) => {
+            let old_m = Manifest::read_tsv(old_path)?;
+            let mut new_m = Manifest::default();
+            for fe in &idx.files {
+                new_m.insert(
+                    fe.rec.path.clone(),
+                    ManifestEntry {
+                        paz_id: 0,
+                        crc: fe.rec.crc,
+                        orig_size: fe.rec.orig_size,
+                        comp_size: fe.rec.comp_size,
+                    },
+                );
+            }
+            let d = manifest::diff(&old_m, &new_m);
+            let set: std::collections::HashSet<String> = d.changed().cloned().collect();
+            eprintln!(
+                "changed-since {}: {} added/modified paths in scope before --filter/--ext",
+                old_path.display(),
+                set.len()
+            );
+            Some(set)
+        }
+        None => None,
+    };
 
     // Select matching files.
     let selected: Vec<&index::FileEntry> = idx
         .files
         .iter()
         .filter(|fe| {
+            if let Some(ref changed) = changed_paths {
+                if !changed.contains(&fe.rec.path) {
+                    return false;
+                }
+            }
             if let Some(ref n) = needle {
                 if !fe.rec.path.to_lowercase().contains(n) {
                     return false;

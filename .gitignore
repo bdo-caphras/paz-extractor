@@ -13,6 +13,11 @@ Cargo.lock.orig
 # Cached path index produced by `paz index`
 /paz-index.txt
 
+# Change-tracking manifests produced by `paz manifest` (~68 MB each, derived,
+# regenerable in ~45 s). The manifests/README.md note IS tracked; the .tsv
+# baselines are not — same precedent as paz-index.txt above.
+/manifests/*.tsv
+
 # Editor / OS noise
 .DS_Store
 *.swp

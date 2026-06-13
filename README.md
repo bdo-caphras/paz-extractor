@@ -123,6 +123,47 @@ cargo build --release
 ```
 Default input dir is `/mnt/d/caphras-paz`; override with `-i <dir>`.
 
+### Change tracking & incremental extraction
+
+Each PAZ index already stores, per file, the game's own `crc` and the
+decompressed `orig_size`. The pair `(crc, orig_size)` is a robust change key
+that needs **no decompression**, so we can fingerprint the entire set as fast as
+`index` (~45 s) and only re-extract what actually changed between game builds.
+
+```bash
+# 1. Fingerprint the whole set into a deterministic, path-sorted TSV manifest.
+#    Columns: path<TAB>paz_id<TAB>crc<TAB>orig_size<TAB>comp_size
+./target/release/paz manifest -o manifests/2026-06-14.tsv      # 834,727 lines, ~68 MB, ~45 s
+
+# 2. After a patch, diff a fresh set against the baseline. Either pass --new
+#    <manifest> or omit it to live-scan -i. Classes: + added, ~ modified,
+#    - removed, unchanged.
+./target/release/paz diff --old manifests/2026-06-14.tsv --count          # just the tallies
+./target/release/paz diff --old manifests/2026-06-14.tsv --ext dds        # tagged path lists
+./target/release/paz diff --old manifests/2026-06-14.tsv --names-only \
+    --filter icon | head                                                  # pipe-friendly
+
+# 3. Incremental extract: only ADDED/MODIFIED paths vs the baseline, still
+#    honouring --filter/--ext/--convert.
+./target/release/paz extract -o /mnt/d/paz-extraction \
+    --changed-since manifests/2026-06-14.tsv --filter icon --convert
+```
+
+**Weekly workflow** (fresh PAZ set dropped at `-i`):
+
+```bash
+NEW=manifests/$(date +%F).tsv
+paz manifest -o "$NEW"                                     # fingerprint the new set
+paz diff --old manifests/<last-baseline>.tsv --new "$NEW" --count   # what moved?
+# re-extract only the delta for each relevant bucket, e.g. skill + cash icons:
+paz extract -o /mnt/d/paz-extraction \
+    --changed-since manifests/<last-baseline>.tsv \
+    --filter icon/new_icon --convert
+# "$NEW" becomes next week's baseline.
+```
+
+Dated baselines live in `manifests/` (gitignored — see that note below).
+
 ### Windows 11 single `.exe`
 
 **Option A — MinGW cross-compile from WSL (no Visual Studio):**
