@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Extraction output — never commit game assets to git
+/out
+/output
+*.PAZ
+*.paz
+*.meta
+
+# Editor / OS noise
+.DS_Store
+*.swp
