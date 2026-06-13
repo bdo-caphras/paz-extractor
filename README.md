@@ -111,6 +111,13 @@ cargo build --release
 ./target/release/paz stats                # summary of the whole set
 ./target/release/paz categories           # extension distribution
 ./target/release/paz list --filter icon --limit 50
+
+# Build a one-off cached path index (~45 s), then search it instantly (~0.2 s):
+./target/release/paz index -o paz-index.txt
+./target/release/paz search territorymark --ext dds            # AND-search by terms
+./target/release/paz search symbolicon ulukita                 # all terms must match
+./target/release/paz search worldmapmonster --count            # just the count
+
 ./target/release/paz extract -o ./out --ext dds,png --convert
 ./target/release/paz extract -o ./out --filter languagedata --ext xml,txt
 ```

@@ -43,6 +43,34 @@ enum Command {
     },
     /// Report the distribution of file extensions across all archives.
     Categories,
+    /// Build a cached, newline-separated list of every virtual path
+    /// (default: `paz-index.txt`). Lets `search` run instantly instead of
+    /// re-scanning ~10k archive indices (~45 s) on every query.
+    Index {
+        /// Where to write the path list.
+        #[arg(short = 'o', long, default_value = "paz-index.txt")]
+        output: PathBuf,
+    },
+    /// Fast search over a cached index file (see `index`). Prints paths that
+    /// contain ALL of the given terms (case-insensitive AND). Optionally
+    /// restrict by extension. Falls back to a live scan if the cache is absent.
+    Search {
+        /// Substrings that must all appear in the path (case-insensitive).
+        #[arg(required = true)]
+        terms: Vec<String>,
+        /// Path to the cached index produced by `index`.
+        #[arg(long, default_value = "paz-index.txt")]
+        cache: PathBuf,
+        /// Only show paths with one of these extensions (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        ext: Vec<String>,
+        /// Maximum number of paths to print (0 = no limit).
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print only the number of matches, not the paths.
+        #[arg(long)]
+        count: bool,
+    },
     /// Extract files to an output directory.
     Extract {
         /// Output root directory.
@@ -122,6 +150,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{:<14} {:>10} {:>14}", ext, count, bytes);
             }
         }
+        Command::Index { output } => {
+            let idx = ArchiveIndex::build(&cli.input, &ice)?;
+            let mut buf = String::with_capacity(idx.files.len() * 48);
+            for fe in &idx.files {
+                buf.push_str(&fe.rec.path);
+                buf.push('\n');
+            }
+            std::fs::write(&output, buf)?;
+            eprintln!("wrote {} paths to {}", idx.files.len(), output.display());
+        }
+        Command::Search {
+            terms,
+            cache,
+            ext,
+            limit,
+            count,
+        } => {
+            search(&cli.input, &ice, terms, cache, ext, limit, count)?;
+        }
         Command::Extract {
             output,
             filter,
@@ -131,6 +178,75 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             extract(&cli.input, &ice, output, filter, ext, convert, limit)?;
         }
+    }
+    Ok(())
+}
+
+/// Whether `path` (lowercased into `lc`) matches all `terms` and, if any
+/// `exts` are given, ends with one of them.
+fn path_matches(lc: &str, terms: &[String], exts: &[String]) -> bool {
+    if !terms.iter().all(|t| lc.contains(t.as_str())) {
+        return false;
+    }
+    if !exts.is_empty() {
+        let ext = lc.rsplit('.').next().unwrap_or("");
+        if !exts.iter().any(|e| e == ext) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fast AND-search. Prefers a cached index file (instant); if it is missing,
+/// falls back to a one-off live scan of every archive.
+fn search(
+    input: &std::path::Path,
+    ice: &IceKey,
+    terms: Vec<String>,
+    cache: PathBuf,
+    exts: Vec<String>,
+    limit: usize,
+    count_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let terms: Vec<String> = terms.into_iter().map(|t| t.to_lowercase()).collect();
+    let exts: Vec<String> = exts.into_iter().map(|e| e.to_lowercase()).collect();
+
+    // Source of paths: cached file if present, else a live scan.
+    let paths: Vec<String> = if cache.exists() {
+        std::fs::read_to_string(&cache)?
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        eprintln!(
+            "note: cache {} not found — doing a live scan (run `paz index` to cache).",
+            cache.display()
+        );
+        ArchiveIndex::build(input, ice)?
+            .files
+            .iter()
+            .map(|fe| fe.rec.path.clone())
+            .collect()
+    };
+
+    let mut matched = 0usize;
+    let mut shown = 0usize;
+    for p in &paths {
+        let lc = p.to_lowercase();
+        if !path_matches(&lc, &terms, &exts) {
+            continue;
+        }
+        matched += 1;
+        if !count_only && (limit == 0 || shown < limit) {
+            println!("{p}");
+            shown += 1;
+        }
+    }
+
+    if count_only {
+        println!("{matched}");
+    } else {
+        eprintln!("({matched} matched, {shown} shown)");
     }
     Ok(())
 }
